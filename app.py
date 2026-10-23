@@ -14,40 +14,20 @@ import streamlit as st
 # ==================== 解析源教案 ====================
 
 def parse_source(docx_path):
+    """解析源教案，返回list of {unit_num, unit_analysis, lessons}。
+    一个文件可能含多个单元（如第三四单元整合）。"""
     doc = Document(docx_path)
     tables = doc.tables
 
-    # 找单元分析表（8行x2列，首格含"单元"）
-    unit_tbl = None
-    for t in tables:
+    cn_num = {'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10}
+
+    # 找所有单元分析表（8行x2列，首格含"设计思路"或"单元"）
+    unit_tbl_indices = []
+    for i, t in enumerate(tables):
         if len(t.rows) == 8 and len(t.columns) == 2:
             txt = t.rows[0].cells[0].text
-            if "单元" in txt or "设计思路" in txt:
-                unit_tbl = t
-                break
-
-    unit_raw = {}
-    if unit_tbl is not None:
-        for row in unit_tbl.rows:
-            try:
-                label = row.cells[0].text.strip()
-                content = row.cells[1].text.strip()
-                unit_raw[label] = content
-            except Exception:
-                pass
-
-    def find_unit(kw):
-        for k, v in unit_raw.items():
-            if kw in k:
-                return v
-        return ""
-
-    unit_analysis = {
-        "教材分析": find_unit("教材分析"),
-        "目标要求": find_unit("教学目标"),
-        "设计意图": (find_unit("设计思路") + "\n\n" + find_unit("教学方法")).strip(),
-        "达成分析": find_unit("教学评价"),
-    }
+            if "设计思路" in txt or "单元" in txt:
+                unit_tbl_indices.append(i)
 
     # 找所有课时起始表
     lesson_starts = []
@@ -58,78 +38,116 @@ def parse_source(docx_path):
         except Exception:
             pass
 
-    # 识别单元号
-    cn_num = {'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10}
-    unit_num = 1
+    # 找所有段落里出现的"第X单元"，按出现顺序对应到单元分析表
+    found_nums = []
     for p in doc.paragraphs:
         m = re.search(r'第([一二三四五六七八九十\d]+)单元', p.text)
         if m:
             s = m.group(1)
-            unit_num = int(s) if s.isdigit() else cn_num.get(s, 1)
-            break
+            n = int(s) if s.isdigit() else cn_num.get(s, None)
+            if n and n not in found_nums:
+                found_nums.append(n)
 
-    lessons = []
-    for idx, start in enumerate(lesson_starts):
-        t_head = tables[start]
-        t_obj = tables[start + 1]
-        t_proc = tables[start + 2]
-        t_board = tables[start + 3]
+    # 把课时分配到对应单元：在哪个单元分析表之后、下一个单元分析表之前
+    units = []
+    for ui, uti in enumerate(unit_tbl_indices):
+        # 这个单元的课时范围：uti之后到下一个单元分析表（或文件末尾）之间的"学校"表
+        next_uti = unit_tbl_indices[ui+1] if ui+1 < len(unit_tbl_indices) else len(tables)
+        my_starts = [s for s in lesson_starts if uti < s < next_uti]
 
-        r0 = [c.text.strip() for c in t_head.rows[0].cells]
-        r1 = [c.text.strip() for c in t_head.rows[1].cells]
-        total = next((c.split("：", 1)[-1].strip() for c in r0 if "总课时" in c), "")
-        title = next((c.split("：", 1)[-1].strip() for c in r1 if "课题" in c), "")
-        leixing = next((c.split("：", 1)[-1].strip() for c in r1 if "教时" in c), "")
+        # 解析单元分析
+        unit_tbl = tables[uti]
+        unit_raw = {}
+        for row in unit_tbl.rows:
+            try:
+                label = row.cells[0].text.strip()
+                content = row.cells[1].text.strip()
+                unit_raw[label] = content
+            except Exception:
+                pass
+        def find_unit(kw):
+            for k, v in unit_raw.items():
+                if kw in k: return v
+            return ""
+        unit_analysis = {
+            "教材分析": find_unit("教材分析"),
+            "目标要求": find_unit("教学目标"),
+            "设计意图": (find_unit("设计思路") + "\n\n" + find_unit("教学方法")).strip(),
+            "达成分析": find_unit("教学评价"),
+        }
 
-        obj_block = t_obj.rows[0].cells[0].text.strip()
+        # 解析单元号：在这个单元分析表前后的段落里找"第X单元"
+        # 单元号：按段落里出现顺序对应到第ui个单元分析表
+        unit_num = found_nums[ui] if ui < len(found_nums) else ui + 1
 
-        def extract(text, start_kw, end_kws):
-            m = re.search(re.escape(start_kw), text)
-            if not m:
-                return ""
-            s = m.end()
-            end_pos = len(text)
-            for ek in end_kws:
-                em = re.search(re.escape(ek), text[s:])
-                if em:
-                    end_pos = min(end_pos, s + em.start())
-            return text[s:end_pos].strip()
+        # 解析课时
+        lessons = []
+        for start in my_starts:
+            t_head = tables[start]
+            t_obj = tables[start + 1]
+            t_proc = tables[start + 2]
+            t_board = tables[start + 3]
 
-        objectives_text = extract(obj_block, "教学目标：", ["教学重点", "教学难点", "教材分析", "学生分析", "教学准备"])
-        key_point = extract(obj_block, "教学重点：", ["教学难点", "教材分析", "学生分析"])
-        diff_point = extract(obj_block, "教学难点：", ["教材分析", "学生分析", "教学准备"])
-        textbook = extract(obj_block, "教材分析：", ["学生分析", "教学准备"])
-        student = extract(obj_block, "学生分析：", ["教学准备"])
-        objectives = [l.strip() for l in objectives_text.split("\n") if l.strip()]
+            r0 = [c.text.strip() for c in t_head.rows[0].cells]
+            r1 = [c.text.strip() for c in t_head.rows[1].cells]
+            total = next((c.split("：", 1)[-1].strip() for c in r0 if "总课时" in c), "")
+            title = next((c.split("：", 1)[-1].strip() for c in r1 if "课题" in c), "")
+            leixing = next((c.split("：", 1)[-1].strip() for c in r1 if "教时" in c), "")
 
-        segments = []
-        for ri in range(2, len(t_proc.rows)):
-            row = t_proc.rows[ri]
-            cells = row.cells
-            if len(cells) < 4:
-                continue
-            seg_name = cells[0].text.strip()
-            if not seg_name:
-                continue
-            segments.append({
-                "name": seg_name,
-                "teacher": cells[1].text.strip(),
-                "student": cells[2].text.strip(),
-                "intent": cells[3].text.strip(),
+            obj_block = t_obj.rows[0].cells[0].text.strip()
+            def extract(text, start_kw, end_kws):
+                m = re.search(re.escape(start_kw), text)
+                if not m: return ""
+                s = m.end()
+                end_pos = len(text)
+                for ek in end_kws:
+                    em = re.search(re.escape(ek), text[s:])
+                    if em: end_pos = min(end_pos, s + em.start())
+                return text[s:end_pos].strip()
+            objectives_text = extract(obj_block, "教学目标：", ["教学重点","教学难点","教材分析","学生分析","教学准备"])
+            key_point = extract(obj_block, "教学重点：", ["教学难点","教材分析","学生分析"])
+            diff_point = extract(obj_block, "教学难点：", ["教材分析","学生分析","教学准备"])
+            textbook = extract(obj_block, "教材分析：", ["学生分析","教学准备"])
+            student = extract(obj_block, "学生分析：", ["教学准备"])
+            objectives = [l.strip() for l in objectives_text.split("\n") if l.strip()]
+
+            # 自动检测教学过程表表头位置
+            header_row = None
+            for ri, row in enumerate(t_proc.rows):
+                c0 = row.cells[0].text.strip()
+                if c0 in ("活动板块", "教  学  过  程", "教学过程"):
+                    header_row = ri
+                    break
+            seg_start = (header_row + 1) if header_row is not None else 2
+
+            segments = []
+            for ri in range(seg_start, len(t_proc.rows)):
+                row = t_proc.rows[ri]
+                cells = row.cells
+                if len(cells) < 4: continue
+                seg_name = cells[0].text.strip()
+                if not seg_name: continue
+                segments.append({
+                    "name": seg_name,
+                    "teacher": cells[1].text.strip(),
+                    "student": cells[2].text.strip(),
+                    "intent": cells[3].text.strip(),
+                })
+
+            board = t_board.rows[0].cells[1].text.strip()
+            practice = t_board.rows[1].cells[1].text.strip()
+            reflection = t_board.rows[2].cells[1].text.strip()
+
+            lessons.append({
+                "total": total, "title": title, "leixing": leixing,
+                "objectives": objectives, "key_point": key_point, "diff_point": diff_point,
+                "textbook": textbook, "student": student,
+                "segments": segments, "board": board, "practice": practice, "reflection": reflection,
             })
 
-        board = t_board.rows[0].cells[1].text.strip()
-        practice = t_board.rows[1].cells[1].text.strip()
-        reflection = t_board.rows[2].cells[1].text.strip()
+        units.append({"unit_analysis": unit_analysis, "lessons": lessons, "unit_num": unit_num})
 
-        lessons.append({
-            "total": total, "title": title, "leixing": leixing,
-            "objectives": objectives, "key_point": key_point, "diff_point": diff_point,
-            "textbook": textbook, "student": student,
-            "segments": segments, "board": board, "practice": practice, "reflection": reflection,
-        })
-
-    return {"unit_analysis": unit_analysis, "lessons": lessons, "unit_num": unit_num}
+    return units
 
 
 # ==================== 填充辅助 ====================
@@ -387,19 +405,21 @@ st.write("### 上传源教案（可多选，每个文件一个单元，按上传
 src_files = st.file_uploader("选择教案docx", type=["docx"], accept_multiple_files=True, key="src")
 
 if src_files:
-    parsed_list = []
+    # 解析所有上传文件，flatten成单元列表
+    all_units = []
     for f in src_files:
         tmp = os.path.join(tempfile.gettempdir(), f"src_{f.name}")
         with open(tmp, "wb") as out:
             out.write(f.getbuffer())
         try:
-            p = parse_source(tmp)
-            parsed_list.append((f.name, p))
-            st.write(f"✅ **{f.name}** → 第{p['unit_num']}单元，{len(p['lessons'])} 课时")
+            units = parse_source(tmp)
+            for u in units:
+                all_units.append(u)
+                st.write(f"✅ **{f.name}** → 第{u['unit_num']}单元，{len(u['lessons'])} 课时")
         except Exception as e:
             st.error(f"❌ {f.name} 解析失败: {e}")
 
-    if parsed_list:
+    if all_units:
         st.write("### 生成")
         if st.button("🚀 生成标准格式教案", type="primary"):
             if tpl_file is None:
@@ -410,7 +430,7 @@ if src_files:
                 f.write(tpl_file.getbuffer())
             out_path = os.path.join(tempfile.gettempdir(), "output_lesson.docx")
             try:
-                _, n = fill_template_multi(tpl_path, [p for _, p in parsed_list], designer, out_path)
+                _, n = fill_template_multi(tpl_path, all_units, designer, out_path)
                 with open(out_path, "rb") as f:
                     st.download_button(
                         label="⬇️ 下载生成的教案",
